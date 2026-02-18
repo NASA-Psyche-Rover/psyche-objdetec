@@ -10,12 +10,18 @@ class Detector:
     def detect_objects(self, frame):
         """
         Runs YOLO inference on a frame.
-        Returns list of bounding boxes [(x1, y1, x2, y2), ...]
+        Returns (boxes, labels, results) where:
+          - boxes: [(x1, y1, x2, y2), ...]
+          - labels: [str, ...] class names for each detection
         """
         results = self.model.predict(frame, conf=self.conf, verbose=False)
         boxes = []
+        labels = []
         for r in results:
-            for box in r.boxes.xyxy:
+            names = r.names
+            for i, box in enumerate(r.boxes.xyxy):
                 x1, y1, x2, y2 = box.tolist()
                 boxes.append((int(x1), int(y1), int(x2), int(y2)))
-        return boxes, results
+                cls_id = int(r.boxes.cls[i].item())
+                labels.append(names.get(cls_id, f"class_{cls_id}"))
+        return boxes, labels, results
