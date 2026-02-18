@@ -1,0 +1,53 @@
+import cv2
+from flask import Flask, Response
+
+from src.camera_stream import get_video_source
+from src.detect import Detector
+from src.utils import compute_cluster_density, draw_alert
+from src.decision import should_proceed
+
+app = Flask(__name__)
+
+cap = None
+detector = None
+frame_area = None
+
+def gen_frames():
+    global cap, detector, frame_area
+
+    if cap is None:
+        cap = get_video_source(0)
+    if detector is None:
+        detector = Detector("models/best.pt")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_area is None:
+            frame_area = frame.shape[0] * frame.shape[1]
+
+        boxes, _ = detector.detect_objects(frame)
+        cluster_density = compute_cluster_density(boxes, frame_area)
+        decision = should_proceed(cluster_density)
+
+        for (x1, y1, x2, y2) in boxes:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        draw_alert(frame, f"Decision: {decision}")
+
+        ok, buffer = cv2.imencode(".jpg", frame)
+        if not ok:
+            continue
+        frame_bytes = buffer.tobytes()
+
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+
+@app.route("/")
+def video_feed():
+    return Response(gen_frames(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+if __name__ == "__main__":
