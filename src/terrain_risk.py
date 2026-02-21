@@ -12,27 +12,41 @@ class TerrainAnalyzer:
         # device=0 uses GPU, device=-1 uses CPU
         self.device = 0 if torch.cuda.is_available() else -1
         self.pipe = pipeline(task="depth-estimation", model=model_name, device=self.device)
+        # model calibration for cubli 
+        self.SLOPE_THRESHOLD=0.15 # max tilt cubli handle
+        self.ROUGHNESS_THRESHOLD=20.0 # max terain roughness for it to be able to jump
         print("model loaded")
 
     def get_risk_assessment(self, frame):
         # covert OpenCV BGR to PIL RGB for the transformer
         pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
         # get depth map; 'predicted_depth' = tensor of relative distances
         output = self.pipe(pil_img)
         depth_map = output["predicted_depth"].squeeze().cpu().numpy()
-
+        #normalize 0-1 
+        depth_min, depth_max = depth_map.min(), depth_map.max()
+        depth_norm = (depth_map - depth_min) / (depth_max - depth_min + 1e-6)
         # extract height, width 
-        h, w = depth_map.shape
-        
-        # find closeness + max, input for mean is region of interest
-        avg_closeness = np.mean(depth_map[int(h * 0.7):, :])
-        max_possible = np.max(depth_map)
-        
-        # risk threshold: avg > 80% of max distance
-        risk_score = (avg_closeness/max_possible) if max_possible > 0 else 0
-        status = "CRITICAL" if risk_score > 0.8 else "SAFE"
-        return depth_map, status, risk_score
+        h, w = depth_norm.shape
+        # reigon of interest = bottom 40% of screen 
+        roi=depth_norm[int(h*0.6):, int(w*0.2):int(w*0.8)]
+        # calculate gradient (slope: tells if cliff or flat)
+        grad_x = cv2.Sobel(roi, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(roi, cv2.CV_64F, 0, 1, ksize=3)
+        slope_mag = np.sqrt(grad_x**2 + grad_y**2)
+        avg_slope = np.mean(slope_mag)
+        roughness = np.std(roi) * 100 # sd = terrain var 
+        # cubli logic
+        if avg_slope > self.SLOPE_THRESHOLD:
+            status="UNSTABLE (SLOPE)"
+            color=(0,0,255)
+        elif roughness>self.ROUGHNESS_THRESHOLD:
+            status="UNSAFE (ROCKY)"
+            color=(0,165,255)
+        else:
+            status="SAFE"
+            color=(0,255,0)
+        return depth_norm, status, avg_slope, color
 
 # main to run webcam 
 if __name__ == "__main__":
@@ -42,23 +56,23 @@ if __name__ == "__main__":
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret: break
+        # run function 
+        depth_map, status, slope, color= analyzer.get_risk_assessment(frame)
+        # visualizations
+        depth_viz = (depth_map * 255).astype(np.uint8)
+        depth_viz = cv2.applyColorMap(depth_viz, cv2.COLORMAP_VIRIDIS)
+        # roi box on original frame
+        h, w, _ = frame.shape
+        cv2.rectangle(frame, (int(w*0.2), int(h*0.6)), (int(w*0.8), h), color, 2)
+        # slope + status text
+        cv2.putText(frame, f"STATUS: {status}", (30, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(frame, f"Slope: {slope:.3f}", (30, 85), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        depth_map, status, score = analyzer.get_risk_assessment(frame)
-
-        # visualization; normalize depth for heatmap
-        depth_norm = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        depth_viz = cv2.applyColorMap(depth_norm, cv2.COLORMAP_MAGMA)
-
-        color = (0, 0, 255) if status == "CRITICAL" else (0, 255, 0)
-        cv2.putText(frame, f"STATUS: {status} ({score:.2f})", (30, 50), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
-
-        # split screen view 
         display = np.hstack((frame, depth_viz))
-        cv2.imshow('Psyche Rover: Terrain Risk Detection', display)
-
+        cv2.imshow('terrain risk analysis', display)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-
     cap.release()
     cv2.destroyAllWindows()
