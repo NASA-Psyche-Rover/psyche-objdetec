@@ -1,208 +1,287 @@
 import time
+import threading
 import cv2
 
-from src.camera_stream import get_video_source
 from src.detect import Detector
-from src.utils import compute_cluster_density, draw_alert, draw_test_button, get_sample_images
-from src.decision import should_proceed
+from src.utils import draw_alert
+from src.proximity_stop import ProximityStopper, ProximityStopConfig
 
 
-def main():
-    cap = get_video_source(0)
+# -----------------------
+# Motor integration layer
+# -----------------------
+class MotorAdapter:
+    """
+    Wraps movement.py into a consistent interface:
+      - forward()
+      - stop()
+      - cleanup()
+    Works even if movement.py exposes different function names.
+    """
 
-    # Pi 5 smooth settings (camera)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 60)
-def show_sample_images(detector):
-    """Show sample images in a viewer. Cycle with space/arrows, close with Escape or 'b'."""
-    paths = get_sample_images()
-    cv2.namedWindow("Sample Images")
-    if not paths:
-        import numpy as np
-        placeholder = np.zeros((300, 500, 3), dtype=np.uint8)
-        placeholder[:] = (40, 40, 40)
-        cv2.putText(placeholder, "Add images to data/sample_images/", (50, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(placeholder, "(jpg, png, bmp)", (50, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
-        cv2.imshow("Sample Images", placeholder)
-        cv2.waitKey(2000)
-        cv2.destroyWindow("Sample Images")
-        return
-    idx = 0
-    while True:
-        img = cv2.imread(paths[idx])
-        if img is None:
-            idx = (idx + 1) % len(paths)
-            continue
-        boxes, labels, _ = detector.detect_objects(img)
-        for (x1, y1, x2, y2), label in zip(boxes, labels):
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(img, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.putText(img, f"Image {idx + 1}/{len(paths)} - Space: next, B/Esc: back", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.imshow("Sample Images", img)
-        k = cv2.waitKey(100) & 0xFF
-        if k == ord("q") or k == 27:  # Esc
-            break
-        if k == ord("b"):
-            break
-        if k == ord(" ") or k == 83:  # Space or Right
-            idx = (idx + 1) % len(paths)
-        elif k == 81:  # Left
-            idx = (idx - 1) % len(paths)
-    cv2.destroyWindow("Sample Images")
+    def __init__(self):
+        self.enabled = False
+        self._obj = None
+        self._mode = None  # "class" or "func"
 
-def main():
-    try:
-        cap = get_video_source(0)  # 0 = webcam; can change to "data/sample_video.mp4"
-        use_webcam = True
-    except IOError:
-        paths = get_sample_images()
-        if not paths:
-            print("No webcam and no images in data/sample_images/. Add images or fix webcam.")
+        mod = None
+        try:
+            import movement as mod  # movement.py in project root
+        except Exception:
+            try:
+                from src import movement as mod  # movement.py inside src/
+            except Exception:
+                mod = None
+
+        if mod is None:
+            print("[MOTORS] movement.py not found. Running VISION ONLY.")
             return
-        cap = None
-        use_webcam = False
-        sample_idx = [0]
 
+        # 1) Preferred: MotorController class
+        if hasattr(mod, "MotorController"):
+            try:
+                self._obj = mod.MotorController()
+                self._mode = "class"
+                self.enabled = True
+                print("[MOTORS] Using movement.MotorController()")
+                return
+            except Exception as e:
+                print(f"[MOTORS] MotorController init failed: {e}. Running VISION ONLY.")
+                return
+
+        # 2) Function-style module
+        # Try to detect usable functions
+        forward_fn = getattr(mod, "forward", None)
+        stop_fn = getattr(mod, "stop", None) or getattr(mod, "stop_all", None)
+        cleanup_fn = getattr(mod, "cleanup", None)
+
+        # If they don't have forward(), we can emulate it using left/right_forward()
+        if forward_fn is None and hasattr(mod, "left_forward") and hasattr(mod, "right_forward"):
+            def forward_fn():
+                mod.left_forward()
+                mod.right_forward()
+
+        # If they don't have cleanup(), we may have GPIO.cleanup
+        if cleanup_fn is None and hasattr(mod, "GPIO"):
+            def cleanup_fn():
+                try:
+                    mod.GPIO.cleanup()
+                except Exception:
+                    pass
+
+        if callable(stop_fn) and callable(forward_fn):
+            self._obj = {"forward": forward_fn, "stop": stop_fn, "cleanup": cleanup_fn}
+            self._mode = "func"
+            self.enabled = True
+            print("[MOTORS] Using functions from movement.py")
+            # Make sure we start safe
+            try:
+                stop_fn()
+            except Exception:
+                pass
+            return
+
+        print("[MOTORS] movement.py found but no usable motor interface. Running VISION ONLY.")
+
+    def forward(self):
+        if not self.enabled:
+            return
+        if self._mode == "class":
+            self._obj.forward()
+        else:
+            self._obj["forward"]()
+
+    def stop(self):
+        if not self.enabled:
+            return
+        if self._mode == "class":
+            self._obj.stop()
+        else:
+            self._obj["stop"]()
+
+    def cleanup(self):
+        if not self.enabled:
+            return
+        try:
+            if self._mode == "class":
+                if hasattr(self._obj, "cleanup"):
+                    self._obj.cleanup()
+            else:
+                if callable(self._obj.get("cleanup")):
+                    self._obj["cleanup"]()
+        except Exception:
+            pass
+
+
+# -----------------------
+# Smooth camera thread
+# -----------------------
+class CameraThread:
+    def __init__(self, index=0, width=640, height=480, fps=60):
+        self.cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, fps)
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        self.lock = threading.Lock()
+        self.latest = None
+        self.running = True
+        self.t = threading.Thread(target=self._reader, daemon=True)
+        self.t.start()
+
+    def _reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            with self.lock:
+                self.latest = frame
+
+    def read_latest(self):
+        with self.lock:
+            if self.latest is None:
+                return False, None
+            return True, self.latest.copy()
+
+    def release(self):
+        self.running = False
+        try:
+            self.t.join(timeout=1.0)
+        except Exception:
+            pass
+        self.cap.release()
+
+
+# -----------------------
+# Main
+# -----------------------
+def main():
+    # ========= Performance knobs =========
+    DISPLAY_W, DISPLAY_H = 640, 480
+    YOLO_W, YOLO_H = 320, 240
+
+    # UI will be ~30–60 FPS smooth. YOLO runs at this rate.
+    YOLO_HZ = 10  # try 8–15
+
+    # ========= Stop-only-when-close =========
+    stopper = ProximityStopper(ProximityStopConfig(
+        stop_threshold=0.80,
+        resume_threshold=0.65,
+        stop_confirm_frames=2,
+        resume_confirm_frames=2
+    ))
+
+    # ========= Init =========
+    motors = MotorAdapter()
+    if motors.enabled:
+        motors.stop()
+
+    cam = CameraThread(index=0, width=DISPLAY_W, height=DISPLAY_H, fps=60)
     detector = Detector("models/best.pt")
 
-    frame_area = None
-    frame_count = 0
-    boxes = []
-    decision = "..."
-    cluster_density = 0.0
+    frame_area = DISPLAY_W * DISPLAY_H
 
-    # FPS counter
-    t0 = time.time()
-    fps = 0.0
+    # Cached inference state
+    boxes_scaled = []
+    labels_cached = []
+    decision = "PROCEED"
+    close_cov = 0.0
 
-    # Shared state for mouse callback (coords are in window space, we store scale for mapping)
-    ui_state = {"test_clicked": False, "button_rect": None, "frame_size": None}
+    # Only send motor updates when state changes
+    last_motor_state = None  # "forward" or "stop"
 
-    def on_mouse(event, x, y, _flags, _param):
-        if event != cv2.EVENT_LBUTTONDOWN:
-            return
-        rect = ui_state.get("button_rect")
-        fsize = ui_state.get("frame_size")
-        if rect is None or fsize is None:
-            return
-        fh, fw = fsize
-        x1, y1, x2, y2 = rect
-        # Map window coords to image coords (OpenCV returns window coords)
-        try:
-            win = cv2.getWindowImageRect("Psyche Vision Nav")
-            if win[2] > 0 and win[3] > 0:
-                sx, sy = x * fw / win[2], y * fh / win[3]
-                if x1 <= sx <= x2 and y1 <= sy <= y2:
-                    ui_state["test_clicked"] = True
-        except cv2.error:
-            if x1 <= x <= x2 and y1 <= y <= y2:
-                ui_state["test_clicked"] = True
+    # UI FPS
+    ui_t0 = time.time()
+    ui_fps = 0.0
 
-    cv2.namedWindow("Psyche Vision Nav")
-    cv2.setMouseCallback("Psyche Vision Nav", on_mouse, None)
+    # YOLO scheduler
+    next_yolo_t = 0.0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Resize once for display
-        frame = cv2.resize(frame, (640, 480))
-
-        if frame_area is None:
-            frame_area = frame.shape[0] * frame.shape[1]
-
-        frame_count += 1
-
-        # Run detection every N frames (2 = faster updates, 3 = smoother)
-        if frame_count % 2 == 0:
-            # Smaller input to YOLO for speed
-            yolo_frame = cv2.resize(frame, (320, 240))
-            boxes_small, _ = detector.detect_objects(yolo_frame)
-
-            # Scale boxes back up to 640x480
-            sx = 640 / 320
-            sy = 480 / 240
-            boxes = [(int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)) for (x1, y1, x2, y2) in boxes_small]
-
-            cluster_density = compute_cluster_density(boxes, frame_area)
-            decision = should_proceed(cluster_density)
-
-        # Draw boxes (latest)
-        for (x1, y1, x2, y2) in boxes:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        draw_alert(frame, f"Decision: {decision}")
-
-        # FPS overlay
-        t1 = time.time()
-        dt = t1 - t0
-        if dt > 0:
-            fps = 0.9 * fps + 0.1 * (1.0 / dt)
-        t0 = t1
-        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-        cv2.imshow("Psyche Vision Nav", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-        if use_webcam:
-            ret, frame = cap.read()
-            if not ret:
-                break
-        else:
-            paths = get_sample_images()
-            frame = cv2.imread(paths[sample_idx[0]])
-            if frame is None:
-                sample_idx[0] = (sample_idx[0] + 1) % len(paths)
+    try:
+        while True:
+            ok, frame = cam.read_latest()
+            if not ok or frame is None:
+                time.sleep(0.01)
                 continue
-            ret = True
-        if frame_area is None:
-            frame_area = frame.shape[0] * frame.shape[1]
 
-        # Run detection to get boxes and labels
-        boxes, labels, _ = detector.detect_objects(frame)
-        cluster_density = compute_cluster_density(boxes, frame_area)
-        decision = should_proceed(cluster_density)
+            frame = cv2.resize(frame, (DISPLAY_W, DISPLAY_H))
+            now = time.time()
 
-        # Draw boxes and labels on each box
-        for (x1, y1, x2, y2), label in zip(boxes, labels):
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            # -------- YOLO (timed) --------
+            if now >= next_yolo_t:
+                next_yolo_t = now + (1.0 / float(YOLO_HZ))
 
-        # Draw HUD: decision + detected object labels
-        alert_lines = [f"Decision: {decision}"]
-        if labels:
-            unique_labels = sorted(set(labels))
-            alert_lines.append(f"Objects Detected: {', '.join(unique_labels)}")
-        alert_lines.append("T: sample images | Q: quit")
-        if not use_webcam:
-            alert_lines.append("Space: next image")
-        draw_alert(frame, alert_lines)
+                yolo_frame = cv2.resize(frame, (YOLO_W, YOLO_H))
 
-        # Draw Test button and store rect for hit testing
-        ui_state["button_rect"] = draw_test_button(frame)
-        ui_state["frame_size"] = frame.shape[:2]
-        cv2.imshow("Psyche Vision Nav", frame)
+                try:
+                    boxes_small, labels, _ = detector.detect_objects(yolo_frame)
+                except Exception:
+                    boxes_small, _ = detector.detect_objects(yolo_frame)
+                    labels = None
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("t") or ui_state["test_clicked"]:
-            ui_state["test_clicked"] = False
-            show_sample_images(detector)
-        elif key == ord("q"):
-            break
-        elif use_webcam and key == ord(" "):
-            pass  # no-op for webcam
-        elif not use_webcam and key == ord(" "):
-            sample_idx[0] = (sample_idx[0] + 1) % len(get_sample_images())
+                if labels is None:
+                    labels = ["obj"] * len(boxes_small)
 
-    if use_webcam and cap:
-        cap.release()
-    cv2.destroyAllWindows()
+                sx = DISPLAY_W / YOLO_W
+                sy = DISPLAY_H / YOLO_H
+                boxes_scaled = [
+                    (int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy))
+                    for (x1, y1, x2, y2) in boxes_small
+                ]
+                labels_cached = labels
+
+                decision, close_cov, _ = stopper.update(boxes_scaled, labels_cached, frame_area)
+
+                # -------- Motors (start/stop only) --------
+                if motors.enabled:
+                    if decision == "STOP":
+                        if last_motor_state != "stop":
+                            motors.stop()
+                            last_motor_state = "stop"
+                    else:
+                        if last_motor_state != "forward":
+                            motors.forward()
+                            last_motor_state = "forward"
+
+            # -------- Draw (fast) --------
+            for (x1, y1, x2, y2) in boxes_scaled:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            # UI FPS
+            ui_t1 = time.time()
+            dt = ui_t1 - ui_t0
+            if dt > 0:
+                ui_fps = 0.9 * ui_fps + 0.1 * (1.0 / dt)
+            ui_t0 = ui_t1
+
+            cov_pct = close_cov * 100.0
+            extra = f"{decision} | close={cov_pct:.0f}% | UI FPS={ui_fps:.0f} | YOLO Hz={YOLO_HZ}"
+            if not motors.enabled:
+                extra += " | MOTORS=OFF"
+            draw_alert(frame, extra)
+
+            cv2.imshow("Psyche Vision Nav", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q") or key == 27:
+                break
+
+    finally:
+        # Always safe-stop the rover
+        try:
+            motors.stop()
+            motors.cleanup()
+        except Exception:
+            pass
+
+        cam.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
