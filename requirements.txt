@@ -2,3 +2,7 @@ ultralytics>=8.0.0
 opencv-python
 numpy
 matplotlib
+torch
+torchvision
+Pillow
+transformers

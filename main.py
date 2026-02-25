@@ -3,8 +3,9 @@ import cv2
 
 from src.camera_stream import get_video_source
 from src.detect import Detector
-from src.utils import compute_cluster_density, draw_alert, draw_test_button, get_sample_images
+from src.utils import compute_cluster_density, draw_alert, draw_test_button, get_sample_images, box_closeness_from_depth
 from src.decision import should_proceed
+from src.terrain_risk import TerrainAnalyzer
 
 def show_sample_images(detector):
     """Show sample images in a viewer."""
@@ -35,14 +36,6 @@ def show_sample_images(detector):
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(img, label, (x1, y1 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-        cv2.putText(img,
-                    f"Image {idx+1}/{len(paths)} - Space: next | B/Esc: exit",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2)
 
         cv2.imshow("Sample Images", img)
 
@@ -77,6 +70,7 @@ def main():
         sample_idx = 0
 
     detector = Detector("models/best.pt")
+    terrain_analyzer = TerrainAnalyzer()
 
     frame_area = None
     frame_count = 0
@@ -84,6 +78,9 @@ def main():
     labels = []
     decision = "..."
     cluster_density = 0.0
+    terrain_status = "SAFE"
+    terrain_score = 0.0
+    last_depth_map = None
 
     # FPS tracking
     t0 = time.time()
@@ -155,16 +152,40 @@ def main():
 
                 cluster_density = compute_cluster_density(boxes, frame_area)
                 decision = should_proceed(cluster_density)
+
+                # Run terrain/depth every 4 frames to save cost; reuse depth for drawing
+                if frame_count % 4 == 0:
+                    try:
+                        last_depth_map, terrain_status, terrain_score = terrain_analyzer.get_risk_assessment(frame)
+                    except Exception:
+                        terrain_status = "ERROR"
+                        terrain_score = 0.0
+                        last_depth_map = None
         else:
             boxes, labels, _ = detector.detect_objects(frame)
             cluster_density = compute_cluster_density(boxes, frame_area)
             decision = should_proceed(cluster_density)
+            # Run terrain every 4 frames in image mode too
+            if frame_count % 4 == 0:
+                try:
+                    last_depth_map, terrain_status, terrain_score = terrain_analyzer.get_risk_assessment(frame)
+                except Exception:
+                    terrain_status = "ERROR"
+                    terrain_score = 0.0
+                    last_depth_map = None
 
         # -------- Drawing --------
         for (x1, y1, x2, y2), label in zip(boxes, labels):
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, label, (x1, y1 - 8),
+            closeness = box_closeness_from_depth(last_depth_map, (x1, y1, x2, y2), frame.shape) if last_depth_map is not None else None
+            label_text = f"{label} {closeness:.2f}" if closeness is not None else label
+            cv2.putText(frame, label_text, (x1, y1 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        # Combine object-density decision with terrain risk
+        nav_decision = decision
+        if terrain_status == "CRITICAL":
+            nav_decision = "STOP"
 
         # FPS
         t1 = time.time()
@@ -173,18 +194,15 @@ def main():
             fps = 0.9 * fps + 0.1 * (1.0 / dt)
         t0 = t1
 
-        # HUD
+        # HUD (no command hints)
         alert_lines = [
-            f"Decision: {decision}",
+            f"Decision: {nav_decision}",
+            f"Terrain: {terrain_status} ({terrain_score:.2f})",
             f"FPS: {fps:.1f}"
         ]
 
         if labels:
             alert_lines.append("Objects: " + ", ".join(sorted(set(labels))))
-
-        alert_lines.append("T: sample images | Q: quit")
-        if not use_webcam:
-            alert_lines.append("Space: next image")
 
         draw_alert(frame, alert_lines)
 
