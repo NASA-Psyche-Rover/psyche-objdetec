@@ -42,11 +42,11 @@ def compute_cluster_density(boxes, frame_area):
     total_area = sum([(x2 - x1) * (y2 - y1) for (x1, y1, x2, y2) in boxes])
     return total_area / frame_area
 
-def draw_alert(frame, text, color=(0, 0, 255), line_height=35):
+def draw_alert(frame, text, color=(0, 0, 255), line_height=28):
     """
     Draw alert text on the frame. If text is a list, draws each item on its own line.
     """
     lines = text if isinstance(text, list) else [text]
     for i, line in enumerate(lines):
-        y = 50 + i * line_height
-        cv2.putText(frame, str(line), (30, y), cv2.QT_FONT_NORMAL, 0.8, color, 2)
+        y = 40 + i * line_height
+        cv2.putText(frame, str(line), (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)

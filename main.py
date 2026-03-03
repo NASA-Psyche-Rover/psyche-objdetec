@@ -3,8 +3,9 @@ import cv2
 
 from src.camera_stream import get_video_source
 from src.detect import Detector
-from src.utils import compute_cluster_density, draw_alert, draw_test_button, get_sample_images
+from src.utils import draw_alert, draw_test_button, get_sample_images
 from src.decision import should_proceed
+from src.terrain_risk import TerrainAnalyzer
 
 def show_sample_images(detector):
     """Show sample images in a viewer."""
@@ -56,16 +57,27 @@ def show_sample_images(detector):
 
 
 def main():
+    # Toggle this depending on your hardware
+    HIGH_QUALITY = False
+
+    if HIGH_QUALITY:
+        TARGET_WIDTH, TARGET_HEIGHT = 960, 720
+        DETECT_EVERY = 2   # run YOLO every 2 frames
+        TERRAIN_EVERY = 4  # run depth every 4 frames
+    else:
+        TARGET_WIDTH, TARGET_HEIGHT = 640, 480
+        DETECT_EVERY = 3   # run YOLO every 3 frames
+        TERRAIN_EVERY = 6  # run depth every 6 frames
     # Try webcam first
     try:
         cap = get_video_source(0)
         use_webcam = True
 
-        # Pi 5 optimized settings
+        # Camera settings tuned for smoother streaming
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 60)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, TARGET_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, 30 if not HIGH_QUALITY else 60)
 
     except IOError:
         paths = get_sample_images()
@@ -77,13 +89,19 @@ def main():
         sample_idx = 0
 
     detector = Detector("models/best.pt")
+    try:
+        terrain_analyzer = TerrainAnalyzer()
+    except Exception as e:
+        print(f"Terrain analyzer disabled: {e}")
+        terrain_analyzer = None
 
     frame_area = None
     frame_count = 0
     boxes = []
     labels = []
     decision = "..."
-    cluster_density = 0.0
+    terrain_status = "DISABLED" if terrain_analyzer is None else "SAFE"
+    terrain_risk = 0.0
 
     # FPS tracking
     t0 = time.time()
@@ -126,7 +144,7 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 break
-            frame = cv2.resize(frame, (640, 480))
+            frame = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT))
         else:
             paths = get_sample_images()
             frame = cv2.imread(paths[sample_idx])
@@ -139,32 +157,47 @@ def main():
 
         frame_count += 1
 
-        # -------- Detection --------
+        # -------- Detection + terrain risk --------
         if use_webcam:
-            # Run detection every 2 frames for speed
-            if frame_count % 2 == 0:
-                small = cv2.resize(frame, (320, 240))
+            # Run detection only every DETECT_EVERY frames for speed
+            if frame_count % DETECT_EVERY == 0:
+                small_w, small_h = TARGET_WIDTH // 2, TARGET_HEIGHT // 2
+                small = cv2.resize(frame, (small_w, small_h))
                 boxes_small, labels, _ = detector.detect_objects(small)
 
-                sx, sy = 640 / 320, 480 / 240
+                sx, sy = TARGET_WIDTH / small_w, TARGET_HEIGHT / small_h
                 boxes = [
                     (int(x1 * sx), int(y1 * sy),
                      int(x2 * sx), int(y2 * sy))
                     for (x1, y1, x2, y2) in boxes_small
                 ]
 
-                cluster_density = compute_cluster_density(boxes, frame_area)
-                decision = should_proceed(cluster_density)
+                # Terrain-based risk: run depth model less often and reuse value
+                if terrain_analyzer is not None and frame_count % TERRAIN_EVERY == 0:
+                    try:
+                        _, terrain_status, terrain_risk, _ = terrain_analyzer.get_risk_assessment(frame)
+                    except Exception as e:
+                        print(f"Terrain analyzer error (webcam): {e}")
+                        terrain_status = "ERROR"
+                        terrain_risk = 0.0
+
+                decision = should_proceed(terrain_risk)
         else:
             boxes, labels, _ = detector.detect_objects(frame)
-            cluster_density = compute_cluster_density(boxes, frame_area)
-            decision = should_proceed(cluster_density)
+            if terrain_analyzer is not None and frame_count % TERRAIN_EVERY == 0:
+                try:
+                    _, terrain_status, terrain_risk, _ = terrain_analyzer.get_risk_assessment(frame)
+                except Exception as e:
+                    print(f"Terrain analyzer error (image): {e}")
+                    terrain_status = "ERROR"
+                    terrain_risk = 0.0
+            decision = should_proceed(terrain_risk)
 
         # -------- Drawing --------
         for (x1, y1, x2, y2), label in zip(boxes, labels):
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, label, (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.putText(frame, label, (x1, y1 - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
         # FPS
         t1 = time.time()
@@ -173,18 +206,15 @@ def main():
             fps = 0.9 * fps + 0.1 * (1.0 / dt)
         t0 = t1
 
-        # HUD
+        # HUD (show terrain_risk output in the corner)
         alert_lines = [
             f"Decision: {decision}",
+            f"Terrain: {terrain_status} ({terrain_risk:.2f})",
             f"FPS: {fps:.1f}"
         ]
 
         if labels:
             alert_lines.append("Objects: " + ", ".join(sorted(set(labels))))
-
-        alert_lines.append("T: sample images | Q: quit")
-        if not use_webcam:
-            alert_lines.append("Space: next image")
 
         draw_alert(frame, alert_lines)
 
