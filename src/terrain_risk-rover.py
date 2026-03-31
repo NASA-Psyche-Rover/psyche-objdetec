@@ -3,6 +3,7 @@
 import cv2
 import torch
 import numpy as np
+import time 
 
 # configs
 DEPTH_DROP_RATIO  = 1.4
@@ -34,6 +35,11 @@ cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     raise RuntimeError("cannot open webcam.")
 
+#fps count 
+prev_time = time.time()
+fps = 0.0
+alpha = 0.9 # higher = smoother 
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
@@ -51,7 +57,7 @@ while cap.isOpened():
     surface_depth = np.mean(depth[surf_top:surf_bot, :])
     zone_depth    = np.mean(depth[zone_top:zone_bot, :])
 
-    #  ratio inverted — drop means watch zone is much LESS deep, (MiDaS: close surface = high value, open crater = low value)
+    # ratio inverted — drop means watch zone is much LESS deep, (MiDaS: close surface = high value, open crater = low value)
     ratio = surface_depth / (zone_depth + 1e-6)
     stop  = ratio > DEPTH_DROP_RATIO
 
@@ -75,6 +81,14 @@ while cap.isOpened():
     label = "STOP - DROP AHEAD" if stop else "CLEAR"
     cv2.putText(display, label, (10, 34),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+    
+    curr_time = time.time()
+    instant_fps = 1.0 / max(curr_time - prev_time, 1e-6)
+    fps = alpha * fps + (1 - alpha) * instant_fps if fps > 0 else instant_fps
+    prev_time = curr_time
+
+    cv2.putText(display, f"FPS: {fps:.1f}", (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
     cv2.putText(display, f"surface depth: {surface_depth:.3f}", (10, h - 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
