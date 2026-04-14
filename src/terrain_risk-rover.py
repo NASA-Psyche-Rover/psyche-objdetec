@@ -4,6 +4,8 @@ import cv2
 import torch
 import numpy as np
 import time 
+import threading 
+import queue
 
 # configs
 DEPTH_DROP_RATIO  = 1.4
@@ -31,6 +33,27 @@ def estimate_depth(frame):
     depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
     return depth
 
+# adding threading 
+frame_queue = queue.Queue(maxsize=1) # frames being processed 
+depth_queue = queue.Queue(maxsize=1) # results being displayed 
+
+def inference_worker():
+    '''Runs own thread; pulls frame pushes depth maps'''
+    while True:
+        frame = frame_queue.get() # gets frame
+        if frame is None: 
+            break 
+        depth = estimate_depth(frame)
+        if depth_queue.full(): 
+            try:
+                depth_queue.get_nowait()
+            except queue.Empty:
+                pass 
+        depth_queue.put(depth)
+
+worker=threading.Thread(target=inference_worker, daemon=True) # thread auto die if main prog crashes 
+worker.start()
+
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     raise RuntimeError("cannot open webcam.")
@@ -38,7 +61,8 @@ if not cap.isOpened():
 #fps count 
 prev_time = time.time()
 fps = 0.0
-alpha = 0.9 # higher = smoother 
+alpha = 0.05 # how much weight on prev sample
+last_depth=None 
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -46,7 +70,23 @@ while cap.isOpened():
         break
 
     small = cv2.resize(frame, (0, 0), fx=FRAME_SCALE, fy=FRAME_SCALE)
-    depth = estimate_depth(small)
+
+    # bfr: depth = estimate_depth(small) -> issue froze loop 200ms for each frame 
+    # avoids waiting for inference to finish in main loop 
+    try: 
+        frame_queue.put_nowait(small)
+    except queue.Full:
+        pass
+    
+    try: 
+        last_depth=depth_queue.get_nowait()
+    except queue.Empty:
+        pass
+    if last_depth is None:
+        continue 
+    depth=last_depth
+        
+    #depth = estimate_depth(small)
     h, w  = depth.shape
 
     surf_top = int(h * (1 - SURFACE_ZONE))   # bottom strip = ground under rover
@@ -102,6 +142,7 @@ while cap.isOpened():
 
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
-
+frame_queue.put(None)
+worker.join(timeout=2)
 cap.release()
 cv2.destroyAllWindows()
