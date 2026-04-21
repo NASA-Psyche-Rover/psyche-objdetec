@@ -61,7 +61,7 @@ if not cap.isOpened():
 #fps count 
 prev_time = time.time()
 fps = 0.0
-alpha = 0.05 # how much weight on prev sample
+alpha = 0.05 # how much weight on prev sample 5% new, 95% old 
 last_depth=None 
 
 while cap.isOpened():
@@ -124,7 +124,7 @@ while cap.isOpened():
     
     curr_time = time.time()
     instant_fps = 1.0 / max(curr_time - prev_time, 1e-6)
-    fps = alpha * fps + (1 - alpha) * instant_fps if fps > 0 else instant_fps
+    fps = alpha * instant_fps + (1 - alpha) * fps if fps > 0 else instant_fps
     prev_time = curr_time
 
     cv2.putText(display, f"FPS: {fps:.1f}", (10, 60),
