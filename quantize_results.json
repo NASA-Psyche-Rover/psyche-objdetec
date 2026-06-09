@@ -1,0 +1,27 @@
+{
+  "model": "MiDaS_small",
+  "n_bench_iterations": 50,
+  "file_sizes_mb": {
+    "onnx_fp32": 0.455,
+    "openvino_fp16": 63.431,
+    "compression_ratio_onnx_vs_ov": 0.01
+  },
+  "latency_ms": {
+    "pytorch_fp32": {
+      "mean": 454.88,
+      "p95": 465.78,
+      "p99": 479.16
+    },
+    "onnx_fp32": {
+      "mean": 39.09,
+      "p95": 41.53,
+      "p99": 42.11
+    },
+    "openvino_fp16": {
+      "mean": 10.14,
+      "p95": 10.83,
+      "p99": 11.13
+    }
+  },
+  "speedup_pytorch_vs_openvino": 44.87
+}
