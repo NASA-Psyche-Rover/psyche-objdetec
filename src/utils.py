@@ -1,8 +1,8 @@
 import cv2
-import numpy as npparent
+import numpy as np
 from pathlib import Path
 
-SAMPLE_IMAGES_DIR = Path(__file__).resolve().parent .parent/ "data" / "sample_images"
+SAMPLE_IMAGES_DIR = Path(__file__).resolve().parent.parent / "data" / "sample_images"
 
 def draw_test_button(frame, padding=20):
     """
@@ -36,11 +36,45 @@ def get_sample_images():
 def compute_cluster_density(boxes, frame_area):
     """
     Estimate density as total object area / frame area.
+
+    This is a 2D coverage signal only -- it can't tell a small nearby rock
+    from a large distant boulder apart, since both can cover the same
+    fraction of the frame. Use estimate_object_proximity() for a
+    distance-aware "is this actually close" signal.
     """
     if len(boxes) == 0:
         return 0
     total_area = sum([(x2 - x1) * (y2 - y1) for (x1, y1, x2, y2) in boxes])
     return total_area / frame_area
+
+def estimate_object_proximity(boxes, depth_map, frame_size):
+    """
+    Distance-aware proximity of the nearest detected object, using the terrain
+    depth map instead of box size alone.
+
+    Samples the depth map at each box's bottom-center point (where the object
+    most likely contacts the ground) and returns the MiDaS-relative closeness
+    of the nearest one, in [0, 1] -- higher means closer. Returns 0.0 if there
+    are no boxes.
+
+    Box coordinates are in `frame_size` (w, h) pixels; depth_map may be a
+    different (downscaled) resolution since terrain analysis runs on a
+    smaller input, so coordinates are rescaled before sampling.
+    """
+    if not boxes:
+        return 0.0
+    frame_w, frame_h = frame_size
+    depth_h, depth_w = depth_map.shape
+
+    closeness_values = []
+    for x1, y1, x2, y2 in boxes:
+        cx = int((x1 + x2) / 2 * depth_w / frame_w)
+        cy = int(y2 * depth_h / frame_h)
+        cx = min(max(cx, 0), depth_w - 1)
+        cy = min(max(cy, 0), depth_h - 1)
+        closeness_values.append(depth_map[cy, cx])
+
+    return float(max(closeness_values))
 
 def draw_alert(frame, text, color=(0, 0, 255), line_height=28):
     """

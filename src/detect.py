@@ -1,10 +1,24 @@
+from pathlib import Path
 from ultralytics import YOLO
-import cv2
+
+DEFAULT_MODEL_PATH = "models/yolov8n.pt"
+
 
 class Detector:
+    """Wraps an Ultralytics YOLO model for rover obstacle detection.
+
+    Falls back to the pretrained YOLOv8n weights if model_path doesn't exist
+    or is an empty placeholder (e.g. models/best.pt before the asteroid
+    dataset has been trained on — see notebooks/train_yolov8.ipynb).
+    """
+
     def __init__(self, model_path="models/best.pt", conf=0.4):
-        self.model = YOLO("models/yolov8n.pt")  # small pretrained model
-        #self.model = YOLO(model_path)
+        path = Path(model_path)
+        if path.exists() and path.stat().st_size > 0:
+            self.model = YOLO(str(path))
+        else:
+            print(f"[Detector] '{model_path}' missing or empty, falling back to {DEFAULT_MODEL_PATH}")
+            self.model = YOLO(DEFAULT_MODEL_PATH)
         self.conf = conf
 
     def detect_objects(self, frame):

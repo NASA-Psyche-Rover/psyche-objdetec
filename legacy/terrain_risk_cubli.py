@@ -1,8 +1,17 @@
+# LEGACY / REFERENCE ONLY -- not imported by main.py or any src/ module.
+#
+# Original terrain-risk prototype built for the "cubli" test platform, using
+# Depth-Anything-V2 via transformers (GPU-oriented, calibrated for a jumping
+# rather than a wheeled rover). Superseded on the rover path by
+# src/terrain_risk.py (ONNX Runtime MiDaS-small, CPU-friendly, slope +
+# roughness + drop-ratio combined into one risk score). Kept here for
+# reference in case the cubli platform work continues separately.
+
 import cv2
 import torch
 import numpy as np
 from PIL import Image
-# PIL is python imaging library process 
+# PIL is python imaging library process
 from transformers import pipeline
 
 # terrain analysis class 

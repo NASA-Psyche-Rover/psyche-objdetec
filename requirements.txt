@@ -1,5 +1,19 @@
+# Core -- required to run main.py (object detection + terrain risk + navigation HUD)
 ultralytics>=8.0.0
 opencv-python
 numpy
-matplotlib
+onnxruntime
+
+# Benchmarking / model export only -- scripts/quantize_profile.py and the
+# legacy Depth-Anything prototype (legacy/terrain_risk_cubli.py). Not needed
+# to run main.py.
+torch
+torchvision
+timm
 transformers
+onnx
+openvino
+
+# Future -- OAK-D Lite integration (see README > Future Implementation).
+# Uncomment once the camera and its SDK are set up:
+# depthai
