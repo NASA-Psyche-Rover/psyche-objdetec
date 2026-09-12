@@ -1,0 +1,19 @@
+# PLACEHOLDER -- do not trust these values.
+#
+# Replace with the real R (3x3) and t (3,) once you've run a calibration
+# tool with the sensors in their FINAL mounted position (livox_camera_calib
+# for targetless, or the official Livox board-based method -- see README).
+#
+# Convention used throughout this codebase: R, t transform a point FROM the
+# LiDAR's frame TO the camera's frame:  p_camera = R @ p_lidar + t
+#
+# Re-run calibration any time the mount is touched -- reprinted, re-seated,
+# even slightly. A stale R/t here fails silently: detections just drift off
+# without any error message.
+
+R:
+  - [1.0, 0.0, 0.0]
+  - [0.0, 1.0, 0.0]
+  - [0.0, 0.0, 1.0]
+
+t: [0.0, 0.0, 0.0]  # meters: [x_offset, y_offset, z_offset]

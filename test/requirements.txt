@@ -1,0 +1,10 @@
+numpy
+opencv-python
+scikit-learn
+matplotlib
+pyyaml
+
+# Only needed on the Jetson, with the real hardware:
+# depthai              # OAK-D-Lite intrinsics + YOLOv6 pipeline
+# ROS2 (Humble) is installed via apt/the ROS2 installer, not pip --
+#   provides rclpy, message_filters, sensor_msgs_py, vision_msgs, nav_msgs
