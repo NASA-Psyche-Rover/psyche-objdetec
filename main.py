@@ -2,7 +2,7 @@ import time
 import cv2
 
 from src.camera_stream import get_video_source
-from src.detect import Detector
+from src.detection import ObjectDetector
 from src.utils import (
     draw_alert, draw_test_button, get_sample_images,
     compute_cluster_density, estimate_object_proximity,
@@ -61,7 +61,9 @@ def show_sample_images(detector):
             idx = (idx + 1) % len(paths)
             continue
 
-        boxes, labels, _ = detector.detect_objects(img)
+        detections = detector.detect(img)
+        boxes = [d.xyxy for d in detections]
+        labels = [detector.class_name(d.class_id) for d in detections]
 
         for (x1, y1, x2, y2), label in zip(boxes, labels):
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -122,7 +124,7 @@ def main():
         use_webcam = False
         sample_idx = 0
 
-    detector = Detector("models/best.pt")
+    detector = ObjectDetector("models/best.pt")
     try:
         terrain_analyzer = TerrainAnalyzer()
     except Exception as e:
@@ -200,7 +202,9 @@ def main():
             if frame_count % DETECT_EVERY == 0:
                 small_w, small_h = TARGET_WIDTH // 2, TARGET_HEIGHT // 2
                 small = cv2.resize(frame, (small_w, small_h))
-                boxes_small, labels, _ = detector.detect_objects(small)
+                detections = detector.detect(small)
+                boxes_small = [d.xyxy for d in detections]
+                labels = [detector.class_name(d.class_id) for d in detections]
 
                 sx, sy = TARGET_WIDTH / small_w, TARGET_HEIGHT / small_h
                 boxes = [
@@ -225,7 +229,9 @@ def main():
             object_proximity = estimate_object_proximity(boxes, depth_map, frame_size) if depth_map is not None else 0.0
             decision = should_proceed(terrain_risk, object_proximity, cluster_density)
         else:
-            boxes, labels, _ = detector.detect_objects(frame)
+            detections = detector.detect(frame)
+            boxes = [d.xyxy for d in detections]
+            labels = [detector.class_name(d.class_id) for d in detections]
             if terrain_analyzer is not None and frame_count % TERRAIN_EVERY == 0:
                 try:
                     terrain_frame = cv2.resize(frame, TERRAIN_INPUT_SIZE)
