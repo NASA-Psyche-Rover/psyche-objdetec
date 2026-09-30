@@ -47,6 +47,39 @@ class PointCloud(np.ndarray):
         self.stamp = getattr(obj, "stamp", None)
 
 
+# -- Blocking reason flags, for TraversabilityGrid.reasons ----------------
+#
+# A bitmask, not an enum: a cell can be untraversable for more than one
+# reason at once (rubble on a grade trips both slope and roughness), and
+# which combinations fire is exactly what you want visible when tuning
+# thresholds against real terrain. Test with `reasons & REASON_SLOPE`, not
+# `reasons == REASON_SLOPE`.
+#
+# uint8, so there is room for eight reasons total. Values are part of the
+# contract -- append new flags, never renumber existing ones, or a saved map
+# or log from an older revision decodes into the wrong reasons.
+REASON_NONE = 0           # not blocked (free or unknown)
+REASON_OBSTACLE = 1 << 0  # positive obstacle standing above the ground surface
+REASON_SLOPE = 1 << 1     # ground grade too steep to drive
+REASON_ROUGHNESS = 1 << 2 # within-cell height spread too high (rubble, gravel)
+REASON_NO_RETURN = 1 << 3 # no return, inside the region the sensor did observe
+                           # -- a crater, ledge, or occluding geometry
+
+_REASON_NAMES = [
+    (REASON_OBSTACLE, "obstacle"),
+    (REASON_SLOPE, "slope"),
+    (REASON_ROUGHNESS, "roughness"),
+    (REASON_NO_RETURN, "no_return"),
+]
+
+
+def reason_names(mask):
+    """Decode a `TraversabilityGrid.reasons` value into a list of flag names,
+    for logs and anomaly metadata. Empty list for REASON_NONE."""
+    mask = int(mask)
+    return [name for flag, name in _REASON_NAMES if mask & flag]
+
+
 @dataclass
 class TraversabilityGrid:
     """(H, W) occupancy-style grid -- mirrors ROS's `nav_msgs/OccupancyGrid`
@@ -73,6 +106,14 @@ class TraversabilityGrid:
         # resolution, z = 0, i.e. already offset by `origin`) into the 3D
         # sensor frame the source cloud was in. None if the producer didn't
         # compute one (e.g. a grid not derived from a plane fit).
+    reasons: np.ndarray = None
+        # (H, W) uint8 bitmask, same shape as `data`: why each blocked cell
+        # is blocked (REASON_* flags above). REASON_NONE wherever `data` is
+        # not 100. Kept as a parallel array rather than as extra values in
+        # `data` on purpose -- `data` stays inside nav_msgs/OccupancyGrid's
+        # 0/100/-1 range, so the adapter to a real OccupancyGrid message
+        # stays thin and this channel rides alongside it. None if the
+        # producer didn't compute one; consumers must handle that.
 
 
 def make_se3(rotation, translation):

@@ -27,7 +27,14 @@ import pytest
 
 from src.depth_to_cloud import depth_to_cloud
 from src.global_map import GlobalMap
-from src.nav_types import make_se3, transform_point
+from dataclasses import replace
+
+from src.nav_types import (
+    REASON_NO_RETURN,
+    REASON_OBSTACLE,
+    make_se3,
+    transform_point,
+)
 from src.traversability_grid import (
     _fit_ground_plane,
     _orient_up,
@@ -304,3 +311,83 @@ def test_save_load_round_trips_map_and_anomalies(tmp_path):
         # JSON has no tuple type, so list vs. tuple differs after a round
         # trip even though the meta content is identical -- normalize.
         assert json.loads(json.dumps(a.meta)) == json.loads(json.dumps(b.meta))
+
+
+# -- Reason-driven anomaly attribution ----------------------------------
+#
+# Before TraversabilityGrid carried a reason channel, integrate() inferred
+# "why is this cell blocked" from grid.labels: blocked with no label entry
+# meant drop-off. Since labels are populated only when a caller passes
+# per-point labels to cloud_to_grid -- which none of these tests do, and
+# which is the default -- that meant every blocked cell logged a crater.
+
+
+def _obstacle_only_scene(stamp=3.0):
+    """A raised block on flat ground, no missing-return region anywhere."""
+    K = _K()
+    block = {"v_lo": 160, "v_hi": 175, "u_lo": 92, "u_hi": 108, "height": 0.3}
+    depth = _ground_depth(K, img_h=200, img_w=200, v_lo=140, v_hi=190, h_cam=1.0,
+                          block=block)
+    cloud = _cloud_from_depth(depth, K, stamp=stamp)
+    return cloud_to_grid(cloud, resolution=RESOLUTION)
+
+
+def test_obstacle_cells_do_not_log_dropoff_anomalies():
+    grid = _obstacle_only_scene()
+    pose = make_se3(_R_CONV, (0.0, 0.0, 0.0))
+    gmap = GlobalMap(resolution=RESOLUTION, width_m=20.0, height_m=20.0,
+                     world_origin=(-10.0, -10.0))
+    gmap.integrate(pose, grid)
+
+    dropoffs = [a for a in gmap.anomalies if a.type == "drop_off"]
+    dropoff_cells = {tuple(a.meta["sensor_cell"]) for a in dropoffs}
+
+    obstacle_cells = {
+        (int(r), int(c))
+        for r, c in np.argwhere(grid.reasons & REASON_OBSTACLE)
+    }
+    assert obstacle_cells, "test setup broken: scene has no obstacle-reason cells"
+
+    # The attribution fix: a cell blocked by an obstacle is not a crater.
+    # Under the old label heuristic every one of these logged a drop_off.
+    assert not (dropoff_cells & obstacle_cells), (
+        f"{len(dropoff_cells & obstacle_cells)} obstacle cells were logged as drop-offs"
+    )
+
+    # Anomaly count now tracks the no-return cells specifically, not the
+    # blocked cells generally.
+    no_return_count = int(np.count_nonzero(grid.reasons & REASON_NO_RETURN))
+    blocked_count = int(np.count_nonzero(grid.data == 100))
+    assert len(dropoffs) == no_return_count
+    assert no_return_count < blocked_count
+
+
+def test_anomaly_meta_carries_decoded_reason_names():
+    grid = _obstacle_only_scene()
+    pose = make_se3(_R_CONV, (0.0, 0.0, 0.0))
+    gmap = GlobalMap(resolution=RESOLUTION, width_m=20.0, height_m=20.0,
+                     world_origin=(-10.0, -10.0))
+    gmap.integrate(pose, grid)
+
+    dropoffs = [a for a in gmap.anomalies if a.type == "drop_off"]
+    assert dropoffs
+    for a in dropoffs:
+        # Decoded names, not raw ints -- this is what lands in the saved
+        # anomaly JSON, where a bare bitmask would be unreadable.
+        assert a.meta["reasons"] == ["no_return"]
+
+
+def test_grid_without_reasons_falls_back_to_label_heuristic():
+    # Pins the documented fallback, and the reason it is a fallback: with no
+    # reason channel and no labels, the old heuristic cannot tell a rock from
+    # a crater and logs every blocked cell.
+    grid = replace(_obstacle_only_scene(), reasons=None)
+    pose = make_se3(_R_CONV, (0.0, 0.0, 0.0))
+    gmap = GlobalMap(resolution=RESOLUTION, width_m=20.0, height_m=20.0,
+                     world_origin=(-10.0, -10.0))
+    gmap.integrate(pose, grid)
+
+    dropoffs = [a for a in gmap.anomalies if a.type == "drop_off"]
+    blocked_count = int(np.count_nonzero(grid.data == 100))
+    assert len(dropoffs) == blocked_count
+    assert all(a.meta["reasons"] is None for a in dropoffs)

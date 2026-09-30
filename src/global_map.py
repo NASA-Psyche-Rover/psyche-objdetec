@@ -19,17 +19,23 @@ repeated free observations progressively overturn a stale "blocked" cell
 (and vice versa), the standard occupancy-grid-mapping approach (this is the
 same value range/update convention ROS's map_server-style mapping uses).
 
-Anomaly provenance limitation (flagged, not fixed here -- fixing it means
-extending traversability_grid.py's TraversabilityGrid.data beyond a plain
-int8 occupancy value, which the "new module only" scope for this change
-doesn't cover): TraversabilityGrid.data doesn't record *why* a cell reads
-100 (obstacle vs. local slope vs. no-return/occlusion) -- only `labels`
-(populated for obstacle-height points only) distinguishes anything. This
-module's drop-off/no-return anomaly heuristic is therefore: a blocked cell
-with no entry in `grid.labels` is logged as a possible no-return/crater
-anomaly. That's correct for the occlusion and unlabeled-obstacle cases, but
-will also catch slope-blocked cells that happen to carry no label -- a
-false positive this module can't currently distinguish from a true drop-off.
+Anomaly provenance: drop-off/crater anomalies are driven by
+`TraversabilityGrid.reasons` (see src/nav_types.py's REASON_* flags), so a
+cell is logged as a drop-off when the producer says it had no return inside
+the observed region -- not when it merely reads blocked.
+
+An earlier revision had no reason channel to read and inferred provenance
+from `grid.labels` instead: a blocked cell with no label entry was logged as
+a possible drop-off. Two false positives came out of that, both now gone.
+Slope-blocked cells were logged as craters, since slope never produces a
+label. Worse, `labels` is populated only when the caller passes per-point
+labels to `cloud_to_grid` at all -- so in the default, label-free case
+*every* blocked cell logged a drop-off anomaly, which is the opposite of an
+anomaly log being useful.
+
+Grids without a `reasons` array (a producer that doesn't compute one) still
+fall back to that heuristic, since it is the only signal available there.
+See `integrate()`.
 """
 
 import json
@@ -37,7 +43,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from src.nav_types import transform_point
+from src.nav_types import REASON_NO_RETURN, reason_names, transform_point
 
 
 @dataclass
@@ -140,7 +146,9 @@ class GlobalMap:
             grid: TraversabilityGrid to integrate. Requires
                 `grid.grid_to_sensor` (set, e.g., by
                 `traversability_grid.cloud_to_grid`) to place cells in 3D
-                before applying `pose`.
+                before applying `pose`. `grid.reasons`, if present, drives
+                drop-off anomaly detection; if it's None this falls back to
+                the label heuristic described in the module docstring.
         """
         if grid.grid_to_sensor is None:
             raise ValueError(
@@ -174,6 +182,7 @@ class GlobalMap:
 
             cell_value = int(grid.data[r, c])
             label = grid.labels.get((r, c))
+            cell_reasons = None if grid.reasons is None else int(grid.reasons[r, c])
 
             wrow, wcol = self._world_to_cell(wx, wy)
             if self._in_bounds(wrow, wcol):
@@ -185,10 +194,23 @@ class GlobalMap:
 
             # Anomaly logging is independent of map bounds/array updates --
             # it's a list keyed by world coordinate, not a grid cell.
-            if cell_value == 100 and label is None:
+            if cell_reasons is not None:
+                # Reason channel available: a drop-off is a no-return cell,
+                # full stop. Obstacle-, slope-, and roughness-blocked cells
+                # are ordinary terrain readings and are not anomalies.
+                is_drop_off = bool(cell_reasons & REASON_NO_RETURN)
+                anomaly_meta = {"sensor_cell": (r, c), "reasons": reason_names(cell_reasons)}
+            else:
+                # No reason channel (producer didn't compute one). Fall back
+                # to the label heuristic, which over-reports -- see the module
+                # docstring.
+                is_drop_off = cell_value == 100 and label is None
+                anomaly_meta = {"sensor_cell": (r, c), "reasons": None}
+
+            if is_drop_off:
                 self.anomalies.append(Anomaly(
                     world_xy=(wx, wy), type="drop_off", stamp=stamp,
-                    meta={"sensor_cell": (r, c)},
+                    meta=anomaly_meta,
                 ))
             if self.known_classes is not None and label is not None and label not in self.known_classes:
                 self.anomalies.append(Anomaly(

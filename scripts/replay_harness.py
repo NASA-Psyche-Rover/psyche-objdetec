@@ -59,15 +59,15 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # so `python scripts/replay_harness.py` finds src/
 
 from src.global_map import GlobalMap
-from src.nav_types import PointCloud, make_se3, transform_point
-from src.planner import plan
-from src.traversability_grid import (
-    _fit_ground_plane,
-    _orient_up,
-    _plane_basis,
-    _project_to_plane,
-    cloud_to_grid,
+from src.nav_types import (
+    REASON_NONE,
+    REASON_NO_RETURN,
+    PointCloud,
+    make_se3,
+    transform_point,
 )
+from src.planner import plan
+from src.traversability_grid import cloud_to_grid
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -206,7 +206,7 @@ def _in_frustum(sensor_points, fov_deg, max_range, min_range):
     return in_range & (angle <= fov_deg / 2.0)
 
 
-def _drop_frustum_boundary_artifacts(grid, cloud, fov_deg, max_range, min_range):
+def _drop_frustum_boundary_artifacts(grid, fov_deg, max_range, min_range):
     """
     cloud_to_grid grids over the RECTANGULAR bounding box of the (plane-
     projected) point cloud. A single camera frame's visible points aren't
@@ -238,43 +238,48 @@ def _drop_frustum_boundary_artifacts(grid, cloud, fov_deg, max_range, min_range)
     artifact above, this margin IS something a real sensor integration
     would still want.
     """
-    # Must read `cloud` itself (float32, per src/nav_types.py PointCloud),
-    # not a separately-kept float64 copy of the same points -- cloud_to_grid
-    # binned points at float32 precision, and re-deriving "observed" at
-    # float64 precision can disagree right at a cell boundary (a point that
-    # floors into cell N at float64 can floor into N-1 or N+1 once rounded
-    # to float32), which silently breaks the "candidates = ~observed" test
-    # below for exactly the single-cell edge cases this function exists to
-    # catch.
-    pts = np.asarray(cloud, dtype=np.float64)
-    normal, centroid = _fit_ground_plane(pts)
-    normal = _orient_up(normal)
-    basis1, basis2 = _plane_basis(normal)
-    _, gx, gy = _project_to_plane(pts, centroid, normal, basis1, basis2)
+    # Candidates come from `grid.reasons` (src/nav_types.py REASON_*): a
+    # no-return cell is, by cloud_to_grid's construction, one with no points
+    # of its own sitting inside the region that did have them -- exactly the
+    # set this function filters. The other reasons (obstacle, slope,
+    # roughness) all require real supporting points, so they are untouched
+    # without needing a separate check.
+    #
+    # This used to re-derive the "no points here" mask locally, by
+    # re-projecting the cloud and re-binning it. That carried a precision
+    # hazard worth recording, since anything else re-deriving a cloud_to_grid
+    # intermediate will hit it: the cloud is float32 (per src/nav_types.py
+    # PointCloud) and cloud_to_grid binned it at that precision, so re-binning
+    # the same points at float64 can disagree by one cell right at a boundary
+    # -- in precisely the single-cell edge cases this function exists to
+    # catch. Reading the producer's own reason channel sidesteps it: there is
+    # no second derivation to disagree with.
+    if grid.reasons is None:
+        raise ValueError(
+            "_drop_frustum_boundary_artifacts needs grid.reasons to identify "
+            "no-return cells -- cloud_to_grid sets it; this grid has none."
+        )
 
-    min_gx, min_gy = grid.origin
     res = grid.resolution
-    height, width = grid.data.shape
-    col = np.clip(((gx - min_gx) / res).astype(int), 0, width - 1)
-    row = np.clip(((gy - min_gy) / res).astype(int), 0, height - 1)
-    observed = np.zeros((height, width), dtype=bool)
-    observed[row, col] = True
-
     trusted_max_range = max_range - 3 * res
     trusted_fov_deg = fov_deg - 5.0
 
     data = grid.data.copy()
-    candidates = np.argwhere((data == 100) & ~observed)
+    reasons = grid.reasons.copy()
+    candidates = np.argwhere(grid.reasons & REASON_NO_RETURN)
     for r, c in candidates:
-        if (int(r), int(c)) in grid.labels:
-            continue  # has real supporting points -- not a boundary artifact
         gxp = c * res  # cell-local coordinate -- see src/global_map.py's integrate() note
         gyp = r * res
         sensor_pt = transform_point(grid.grid_to_sensor, (gxp, gyp, 0.0))
         if not _in_frustum(sensor_pt[np.newaxis, :], trusted_fov_deg, trusted_max_range, min_range)[0]:
             data[r, c] = -1
+            # Clear the reason too. A cell demoted to unknown is no longer
+            # blocked, and leaving REASON_NO_RETURN on it would keep
+            # GlobalMap.integrate logging it as a crater -- the exact false
+            # positive the reason channel exists to remove.
+            reasons[r, c] = REASON_NONE
 
-    return replace(grid, data=data)
+    return replace(grid, data=data, reasons=reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +336,7 @@ def run_simulation(
 
         cloud = PointCloud(visible_points, is_metric=True, stamp=float(frame_idx))
         grid = cloud_to_grid(cloud, resolution=resolution)
-        grid = _drop_frustum_boundary_artifacts(grid, cloud, fov_deg, max_range, min_range=0.05)
+        grid = _drop_frustum_boundary_artifacts(grid, fov_deg, max_range, min_range=0.05)
         global_map.integrate(pose, grid)
 
         if frame_idx % plan_every == 0:

@@ -25,21 +25,66 @@ caller concern, same as CONTRACTS.md leaves camera->world generally.
 Classification concept (slope / roughness / drop-off) is borrowed from
 src/terrain_risk.py's taxonomy for continuity, but none of its threshold
 *values* are reused -- those are tuned against MiDaS's unitless disparity
-output and don't apply to a metric point cloud. GROUND_TOL, OBSTACLE_HEIGHT,
-and SLOPE_THRESHOLD_DEG below are new constants in real metric/angular units.
+output and don't apply to a metric point cloud. OBSTACLE_HEIGHT,
+SLOPE_THRESHOLD_DEG, and ROUGHNESS_TOL below are new constants in real
+metric/angular units.
+
+Slope and roughness are separate criteria here, deliberately. Slope is a
+*between-cell* property -- the grade of the ground surface, measured over a
+baseline of several cells (see SLOPE_BASELINE_CELLS) -- while roughness is a
+*within-cell* property, the spread of returns inside one cell. An earlier
+revision measured only within-cell spread and thresholded it with
+SLOPE_THRESHOLD_DEG, which both mis-named the quantity and, at 5 cm cells,
+put the threshold below the plane fit's own noise floor.
+
+Scope limit on the slope test, unchanged by that fix and worth knowing before
+tuning against it: every height here is measured against the RANSAC-fitted
+plane, and RANSAC fits whichever surface dominates the cloud. A scene that is
+one uniform grade end to end therefore fits a plane *along* that grade and
+reads as flat -- this module detects relief relative to the dominant surface
+(a ramp or berm within a mostly-level scene), not the global tilt of the
+scene. Recovering global tilt needs a gravity/pose reference, which this
+module deliberately has no input for (see the frame note above). The band it
+does see is bounded below by HEIGHT_NOISE_TOL and above by OBSTACLE_HEIGHT,
+beyond which returns stop counting as ground at all.
 """
 
 import numpy as np
 
-from src.nav_types import TraversabilityGrid, make_se3
+from src.nav_types import (
+    REASON_NO_RETURN,
+    REASON_OBSTACLE,
+    REASON_ROUGHNESS,
+    REASON_SLOPE,
+    TraversabilityGrid,
+    make_se3,
+)
 
 # -- New metric-space constants (meters / degrees). Not copied from
 # src/terrain_risk.py -- its slope/roughness/drop thresholds are tuned
 # against MiDaS's unitless, per-frame-normalized disparity output and
 # have no valid conversion into real units.
-GROUND_TOL = 0.03          # meters: points within this of the fitted plane count as ground
 OBSTACLE_HEIGHT = 0.10     # meters: points above the plane by more than this are a blocking obstacle
-SLOPE_THRESHOLD_DEG = 25.0  # degrees: local rise/run beyond this makes a cell untraversable
+SLOPE_THRESHOLD_DEG = 25.0  # degrees: ground grade beyond this makes a cell untraversable
+ROUGHNESS_TOL = 0.06       # meters: within-cell height spread beyond this makes a cell untraversable
+
+# Baseline, in cells, over which slope is measured (see _max_neighbor_slope).
+# Slope is rise/run, so a short run makes the measurement noise-dominated: at
+# resolution 0.05 a *single*-cell baseline puts SLOPE_THRESHOLD_DEG's rise at
+# 0.05 * tan(25 deg) = 0.023 m, which is at/below both RANSAC_DIST_THRESHOLD
+# (0.02) and HEIGHT_NOISE_TOL (0.03) -- i.e. below the plane fit's own noise,
+# so the test would fire on noise alone. A 2-cell baseline (0.10 m) puts that
+# rise at 0.047 m, comfortably clear of it. Raise this, not the angle, if
+# slope still over-triggers on real sensor data.
+SLOPE_BASELINE_CELLS = 2
+
+# meters: height differences smaller than this are treated as plane-fit /
+# sensor noise rather than real relief, and are never enough on their own to
+# block a cell. (Replaces the former GROUND_TOL, which was defined with the
+# same value but never used anywhere.) At the default resolution, baseline,
+# and angle this gate is inert -- SLOPE_THRESHOLD_DEG binds first -- and it
+# exists to keep that true if any of those three are tuned downward.
+HEIGHT_NOISE_TOL = 0.03
 
 # RANSAC plane-fit parameters (not part of the metric contract above, just
 # fitting hyperparameters).
@@ -96,7 +141,12 @@ def _orient_up(normal):
     """Flip `normal` if needed so it points "up": in this pipeline's
     camera-frame convention Y increases downward (see src/depth_to_cloud.py's
     back-projection: Y = (v - cy) * Z / fy grows with image row v, which
-    grows downward), so "up" is the -Y direction."""
+    grows downward), so "up" is the -Y direction.
+
+    This -Y-up assumption is load-bearing and unchecked -- see docs/CONTRACTS.md
+    "Frame Conventions". A cloud in any other convention (e.g. a +Z-up lidar
+    cloud) gets its ground normal flipped here, which inverts obstacle height
+    and therefore free vs. blocked across the whole grid, silently."""
     if np.dot(normal, np.array([0.0, -1.0, 0.0])) < 0:
         normal = -normal
     return normal
@@ -141,6 +191,73 @@ def _dilate(mask, radius):
     return out
 
 
+def _shift(values, mask, dr, dc):
+    """Shift a (values, mask) pair so that `out[r, c]` holds
+    `values[r + dr, c + dc]`. Cells whose source falls outside the array come
+    back masked off, so callers never need to special-case grid borders."""
+    out_v = np.zeros_like(values)
+    out_m = np.zeros_like(mask)
+    H, W = values.shape
+
+    dst_r0, dst_r1 = max(0, -dr), min(H, H - dr)
+    dst_c0, dst_c1 = max(0, -dc), min(W, W - dc)
+    if dst_r0 >= dst_r1 or dst_c0 >= dst_c1:
+        return out_v, out_m  # shift larger than the array; nothing overlaps
+
+    src_r0, src_r1 = dst_r0 + dr, dst_r1 + dr
+    src_c0, src_c1 = dst_c0 + dc, dst_c1 + dc
+    out_v[dst_r0:dst_r1, dst_c0:dst_c1] = values[src_r0:src_r1, src_c0:src_c1]
+    out_m[dst_r0:dst_r1, dst_c0:dst_c1] = mask[src_r0:src_r1, src_c0:src_c1]
+    return out_v, out_m
+
+
+def _max_neighbor_slope(ground_h, ground_observed, resolution,
+                        baseline_cells=SLOPE_BASELINE_CELLS):
+    """Steepest ground grade from each cell to another cell on the Chebyshev
+    ring at `baseline_cells`.
+
+    `ground_h` is the per-cell ground-surface height and `ground_observed`
+    marks which cells have one; cells without are skipped on both sides of
+    every comparison.
+
+    Returns `(slope_deg, rise)`: the steepest grade in degrees, and the height
+    difference that produced it (which the caller gates against
+    HEIGHT_NOISE_TOL). Both are 0 where a cell is unobserved or has no
+    observed partner on the ring.
+
+    Only the ring at exactly `baseline_cells` is compared, not every cell
+    within it: including nearer neighbors would reintroduce the short, noise-
+    dominated baselines this parameter exists to avoid. Each comparison
+    divides by the true center-to-center distance, so diagonal partners
+    (run = baseline * sqrt(2) * resolution) are not counted as steeper than
+    orthogonal ones.
+
+    This under-reports a sharp step, which spans far less than the baseline --
+    by design. Steps are caught by OBSTACLE_HEIGHT above the plane and by the
+    occlusion/no-return check below it; this function is for sustained grades,
+    the thing neither of those sees.
+    """
+    max_grad = np.zeros_like(ground_h)
+    max_rise = np.zeros_like(ground_h)
+
+    r = baseline_cells
+    for dr in range(-r, r + 1):
+        for dc in range(-r, r + 1):
+            if max(abs(dr), abs(dc)) != r:
+                continue  # interior of the ring, not the ring itself
+            shifted_h, shifted_obs = _shift(ground_h, ground_observed, dr, dc)
+            pair = ground_observed & shifted_obs
+            rise = np.where(pair, np.abs(ground_h - shifted_h), 0.0)
+            run = resolution * np.hypot(dr, dc)
+            grad = rise / run
+
+            steeper = grad > max_grad
+            max_grad = np.where(steeper, grad, max_grad)
+            max_rise = np.where(steeper, rise, max_rise)
+
+    return np.degrees(np.arctan(max_grad)), max_rise
+
+
 def cloud_to_grid(cloud, resolution=0.05, labels=None):
     """
     Project a metric point cloud into a top-down TraversabilityGrid.
@@ -160,9 +277,11 @@ def cloud_to_grid(cloud, resolution=0.05, labels=None):
 
     Returns:
         TraversabilityGrid with `stamp` propagated from `cloud.stamp`
-        (None if the cloud doesn't carry one), and `grid_to_sensor` set to
+        (None if the cloud doesn't carry one), `grid_to_sensor` set to
         the SE3 (sensor <- grid) transform built from the fitted plane's
-        basis + this grid's origin (see src/nav_types.py `TraversabilityGrid`).
+        basis + this grid's origin, and `reasons` set to the per-cell
+        bitmask of why each blocked cell is blocked (see src/nav_types.py
+        `TraversabilityGrid` and its REASON_* flags).
     """
     if not getattr(cloud, "is_metric", False):
         raise ValueError(
@@ -198,16 +317,53 @@ def cloud_to_grid(cloud, resolution=0.05, labels=None):
     np.maximum.at(max_h, flat_idx, height)
     min_h = np.full(H * W, np.inf)
     np.minimum.at(min_h, flat_idx, height)
+    # Ground-surface accumulation, for the slope test: points standing more
+    # than OBSTACLE_HEIGHT above the plane are not ground and must not enter
+    # the slope surface. Including them raises a cell's height toward the
+    # obstacle on top of it, which reads as a steep grade against its flat
+    # neighbors and blocks a ring of clear ground around every obstacle --
+    # inflating each obstacle by the slope baseline and stealing clearance
+    # from the planner.
+    is_ground_pt = height <= OBSTACLE_HEIGHT
+    ground_counts = np.zeros(H * W, dtype=int)
+    np.add.at(ground_counts, flat_idx[is_ground_pt], 1)
+    ground_sum = np.zeros(H * W, dtype=np.float64)
+    np.add.at(ground_sum, flat_idx[is_ground_pt], height[is_ground_pt])
 
     counts = counts.reshape(H, W)
     max_h = max_h.reshape(H, W)
     min_h = min_h.reshape(H, W)
+    ground_counts = ground_counts.reshape(H, W)
+    ground_sum = ground_sum.reshape(H, W)
     observed = counts > 0
 
-    # Slope check: local rise/run within a cell vs. SLOPE_THRESHOLD_DEG.
-    rise_limit = resolution * np.tan(np.radians(SLOPE_THRESHOLD_DEG))
+    # Per-cell representative ground height. Mean, not min: min is the more
+    # obvious "lowest return wins" pick, but a single negative noise outlier
+    # then drags the whole cell down and fabricates a grade against its
+    # neighbors. A cell with no ground returns at all (fully covered by an
+    # obstacle) has no ground height, so it sits out the slope comparison
+    # entirely -- it is already blocked by OBSTACLE_HEIGHT.
+    ground_observed = ground_counts > 0
+    ground_h = np.zeros((H, W), dtype=np.float64)
+    np.divide(ground_sum, ground_counts, out=ground_h, where=ground_observed)
+
+    # Slope: grade of the ground surface *between* cells, measured over
+    # SLOPE_BASELINE_CELLS. The rise gate keeps a cell from being blocked by a
+    # height difference that is indistinguishable from plane-fit noise, however
+    # steep that difference computes out to be over a short run.
+    slope_deg, slope_rise = _max_neighbor_slope(ground_h, ground_observed, resolution)
+    slope_blocked = (
+        ground_observed
+        & (slope_deg > SLOPE_THRESHOLD_DEG)
+        & (slope_rise > HEIGHT_NOISE_TOL)
+    )
+
+    # Roughness: spread of returns *within* one cell -- rubble or gravel that
+    # is level overall but not drivable. A cell holding very few points
+    # under-reports its spread, which biases toward free, not toward a false
+    # block, so there's no minimum-count gate here.
     height_range = np.where(observed, max_h - min_h, 0.0)
-    slope_blocked = observed & (height_range > rise_limit)
+    roughness_blocked = observed & (height_range > ROUGHNESS_TOL)
 
     obstacle_blocked = observed & (max_h > OBSTACLE_HEIGHT)
 
@@ -222,7 +378,19 @@ def cloud_to_grid(cloud, resolution=0.05, labels=None):
     data[observed] = 0
     data[obstacle_blocked] = 100
     data[slope_blocked] = 100
+    data[roughness_blocked] = 100
     data[occluded] = 100
+
+    # Per-cell reason bitmask, parallel to `data` (see src/nav_types.py's
+    # REASON_* flags). OR'd, not assigned in precedence order: a cell that
+    # trips several criteria records all of them, which is what makes
+    # "how much of this map is slope-only vs. slope-and-roughness" a
+    # question you can answer while tuning thresholds against real terrain.
+    reasons = np.zeros((H, W), dtype=np.uint8)
+    reasons[obstacle_blocked] |= REASON_OBSTACLE
+    reasons[slope_blocked] |= REASON_SLOPE
+    reasons[roughness_blocked] |= REASON_ROUGHNESS
+    reasons[occluded] |= REASON_NO_RETURN
 
     label_map = {}
     if labels is not None:
@@ -258,4 +426,5 @@ def cloud_to_grid(cloud, resolution=0.05, labels=None):
         stamp=stamp,
         labels=label_map,
         grid_to_sensor=grid_to_sensor,
+        reasons=reasons,
     )
