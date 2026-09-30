@@ -1,7 +1,7 @@
 """
 OAK-D Lite object detection + real depth-sensing test.
 
-Runs YOLO detection (via the existing Detector class) on the OAK-D Lite's RGB
+Runs YOLO detection (via src/detection.py's ObjectDetector) on the OAK-D Lite's RGB
 feed, and uses the OAK-D's own stereo depth (real millimeters) to report the
 actual distance to each detected object -- no MiDaS, no relative depth, no
 terrain risk pipeline. This is a focused test of detection + real depth fused
@@ -16,7 +16,7 @@ import time
 import cv2
 
 from src.camera_stream import OakDLiteCamera, estimate_object_distances_mm
-from src.detect import Detector
+from src.detection import ObjectDetector
 
 print("DEBUG: imports done")
 
@@ -59,7 +59,7 @@ def main():
         return
 
     print("DEBUG: about to load detector")
-    detector = Detector("models/best.pt")
+    detector = ObjectDetector("models/best.pt")
     print("DEBUG: detector loaded")
 
     cv2.namedWindow("OAK-D Detection + Depth")
@@ -93,7 +93,9 @@ def main():
         if frame_count % DETECT_EVERY == 0:
             small_w, small_h = TARGET_WIDTH // 2, TARGET_HEIGHT // 2
             small = cv2.resize(frame, (small_w, small_h))
-            boxes_small, labels, _ = detector.detect_objects(small)
+            detections = detector.detect(small)
+            boxes_small = [d.xyxy for d in detections]
+            labels = [detector.class_name(d.class_id) for d in detections]
 
             sx, sy = TARGET_WIDTH / small_w, TARGET_HEIGHT / small_h
             boxes = [

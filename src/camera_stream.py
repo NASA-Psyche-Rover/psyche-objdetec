@@ -144,3 +144,4 @@ def nearest_object_distance_m(boxes, depth_frame, frame_size):
     Returns None if no box had a valid depth reading anywhere."""
     distances_mm = estimate_object_distances_mm(boxes, depth_frame, frame_size)
     valid = [d for d in distances_mm if d is not None]
+    return min(valid) / 1000.0 if valid else None
