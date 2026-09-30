@@ -14,6 +14,10 @@ transformers
 onnx
 openvino
 
+# Tests -- pytest suite in tests/. Also needs the Core block above
+# (tests/test_detection.py runs real YOLO inference, no mocking).
+pytest
+
 # Future -- OAK-D Lite integration (see README > Future Implementation).
 # Uncomment once the camera and its SDK are set up:
 # depthai
