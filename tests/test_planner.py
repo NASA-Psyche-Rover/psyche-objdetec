@@ -110,7 +110,7 @@ def test_cells_to_world_uses_resolution_and_origin_cell_centers():
 
 def test_safety_gate_stop_overrides_plan_to_halt():
     waypoint = (3, 4)
-    result = safety_gate(waypoint, terrain_risk=RISK_THRESHOLD + 0.5, object_proximity=0.0, cluster_density=0.0)
+    result = safety_gate(waypoint, terrain_risk=RISK_THRESHOLD + 0.5, object_proximity=0.0)
 
     assert isinstance(result, GateResult)
     assert result.decision == "STOP"
@@ -119,9 +119,13 @@ def test_safety_gate_stop_overrides_plan_to_halt():
     assert result.waypoint is None
 
 
-def test_safety_gate_caution_passes_through_but_marks():
+def test_safety_gate_caution_passes_through_but_marks(monkeypatch):
+    # should_proceed() no longer has a CAUTION outcome of its own (the 2D
+    # cluster-density term that produced it is gone), but the gate's policy
+    # for a CAUTION answer is still part of its contract.
+    monkeypatch.setattr("src.planner.should_proceed", lambda *a, **k: "CAUTION")
     waypoint = (3, 4)
-    result = safety_gate(waypoint, terrain_risk=0.0, object_proximity=0.0, cluster_density=0.9)
+    result = safety_gate(waypoint, terrain_risk=0.0, object_proximity=0.0)
 
     assert result.decision == "CAUTION"
     assert result.action == "PROCEED"
@@ -132,7 +136,7 @@ def test_safety_gate_caution_passes_through_but_marks():
 
 def test_safety_gate_proceed_passes_through_unmarked():
     waypoint = (3, 4)
-    result = safety_gate(waypoint, terrain_risk=0.0, object_proximity=0.0, cluster_density=0.0)
+    result = safety_gate(waypoint, terrain_risk=0.0, object_proximity=0.0)
 
     assert result.decision == "PROCEED"
     assert result.action == "PROCEED"

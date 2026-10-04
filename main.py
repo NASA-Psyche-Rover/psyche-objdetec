@@ -5,7 +5,7 @@ from src.camera_stream import get_video_source
 from src.detection import ObjectDetector
 from src.utils import (
     draw_alert, draw_test_button, get_sample_images,
-    compute_cluster_density, estimate_object_proximity,
+    estimate_object_proximity,
 )
 from src.decision import should_proceed, PROXIMITY_THRESHOLD
 from src.terrain_risk import TerrainAnalyzer
@@ -131,7 +131,6 @@ def main():
         print(f"Terrain analyzer disabled: {e}")
         terrain_analyzer = None
 
-    frame_area = None
     frame_count = 0
     boxes = []
     labels = []
@@ -191,9 +190,6 @@ def main():
                 sample_idx = (sample_idx + 1) % len(paths)
                 continue
 
-        if frame_area is None:
-            frame_area = frame.shape[0] * frame.shape[1]
-
         frame_count += 1
 
         # -------- Detection + terrain risk --------
@@ -225,9 +221,8 @@ def main():
                     terrain_risk = 0.0
 
             frame_size = (frame.shape[1], frame.shape[0])
-            cluster_density = compute_cluster_density(boxes, frame_area)
             object_proximity = estimate_object_proximity(boxes, depth_map, frame_size) if depth_map is not None else 0.0
-            decision = should_proceed(terrain_risk, object_proximity, cluster_density)
+            decision = should_proceed(terrain_risk, object_proximity)
         else:
             detections = detector.detect(frame)
             boxes = [d.xyxy for d in detections]
@@ -243,9 +238,8 @@ def main():
                     terrain_status = "ERROR"
                     terrain_risk = 0.0
             frame_size = (frame.shape[1], frame.shape[0])
-            cluster_density = compute_cluster_density(boxes, frame_area)
             object_proximity = estimate_object_proximity(boxes, depth_map, frame_size) if depth_map is not None else 0.0
-            decision = should_proceed(terrain_risk, object_proximity, cluster_density)
+            decision = should_proceed(terrain_risk, object_proximity)
 
         # -------- Drawing --------
         for (x1, y1, x2, y2), label in zip(boxes, labels):

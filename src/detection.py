@@ -22,6 +22,14 @@ from src.nav_types import Detection
 
 DEFAULT_MODEL_PATH = "models/yolov8n.pt"
 
+# Rock detectors, best first. best.pt is the custom-trained asteroid model
+# (notebooks/train_yolov8.ipynb); rocks_yoloworld.pt is an open-vocabulary
+# YOLO-World model with its classes fixed to rock/boulder/stone (built by
+# scripts/build_rock_model.py -- no training data needed). The pretrained
+# COCO yolov8n.pt has no rock class at all, so it is a last resort that
+# detects generic objects only.
+ROCK_MODEL_PATHS = ("models/best.pt", "models/rocks_yoloworld.pt")
+
 
 class ObjectDetector:
     """Wraps an Ultralytics YOLO model for rover obstacle detection.
@@ -32,12 +40,19 @@ class ObjectDetector:
     """
 
     def __init__(self, model_path="models/best.pt", conf=0.4):
-        path = Path(model_path)
-        if path.exists() and path.stat().st_size > 0:
-            self.model = YOLO(str(path))
-        else:
-            print(f"[ObjectDetector] '{model_path}' missing or empty, falling back to {DEFAULT_MODEL_PATH}")
-            self.model = YOLO(DEFAULT_MODEL_PATH)
+        candidates = (model_path,) if isinstance(model_path, (str, Path)) else tuple(model_path)
+        self.model_path = None
+        for candidate in candidates:
+            path = Path(candidate)
+            if path.exists() and path.stat().st_size > 0:
+                self.model_path = str(path)
+                break
+        if self.model_path is None:
+            print(f"[ObjectDetector] {', '.join(map(str, candidates))} missing or empty, "
+                  f"falling back to {DEFAULT_MODEL_PATH}")
+            self.model_path = DEFAULT_MODEL_PATH
+        self.model = YOLO(self.model_path)
+        self.is_rock_model = self.model_path != DEFAULT_MODEL_PATH
         self.conf = conf
 
     def detect(self, frame):

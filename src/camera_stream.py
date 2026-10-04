@@ -21,11 +21,15 @@ class OakDLiteCamera:
     `depthai` is imported lazily so the rest of the codebase keeps working
     without it installed.
 
-    Note: this currently only returns RGB + raw stereo depth (mm) for camera
-    acquisition. It does NOT yet feed real metric depth into TerrainAnalyzer --
-    that swap is a separate, bigger change (see README > Future Implementation)
-    since the slope/roughness/drop-ratio thresholds were tuned against MiDaS's
-    *relative* depth and need to be re-derived against real millimeter values.
+    Depth is aligned to the RGB camera (CAM_A) and output at `rgb_size`, so
+    depth pixel (u, v) is the same scene point as RGB pixel (u, v). That is
+    what makes "distance to this YOLO box" and the depth heatmap accurate:
+    the mono pair has a different field of view and a ~3.75 cm offset from
+    the RGB sensor, so sampling unaligned depth with RGB box coordinates
+    reads the wrong part of the scene. `self.K` is the matching (3, 3) RGB
+    intrinsics at `rgb_size`, from the device's factory calibration, for
+    back-projecting that depth into a metric point cloud
+    (src/depth_to_cloud.py).
     """
 
     def __init__(self, rgb_size=(640, 480), fps=30):
@@ -43,13 +47,20 @@ class OakDLiteCamera:
         mono_right = self.pipeline.create(dai.node.Camera).build(
             dai.CameraBoardSocket.CAM_C, sensorFps=fps
         )
+        # DENSITY preset: measured ~50% more valid pixels than DEFAULT/ROBOTICS
+        # on this unit at the same frame rate -- coverage matters more than
+        # per-pixel confidence here, since holes are what blind the rover.
         stereo = self.pipeline.create(dai.node.StereoDepth).build(
-            mono_left.requestOutput((640, 400)), mono_right.requestOutput((640, 400))
+            mono_left.requestOutput((640, 400)), mono_right.requestOutput((640, 400)),
+            presetMode=dai.node.StereoDepth.PresetMode.DENSITY,
         )
         stereo.setLeftRightCheck(True)
         # Short baseline (~7.5cm) on the Lite means poor close-range depth by
-        # default -- this roughly halves the minimum usable distance.
+        # default -- extended disparity brings the minimum range down to
+        # ~18 cm (measured), which the 30 cm STOP distance depends on.
         stereo.setExtendedDisparity(True)
+        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
+        stereo.setOutputSize(rgb_size[0], rgb_size[1])
 
         self.rgb_queue = cam_rgb.requestOutput(rgb_size).createOutputQueue(
             maxSize=1, blocking=False
@@ -57,6 +68,12 @@ class OakDLiteCamera:
         self.depth_queue = stereo.depth.createOutputQueue(maxSize=1, blocking=False)
 
         self.pipeline.start()
+
+        calib = self.pipeline.getDefaultDevice().readCalibration()
+        self.K = np.array(
+            calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, rgb_size[0], rgb_size[1]),
+            dtype=np.float64,
+        )
 
         # Cache the last valid frames so a single missed tick on either
         # stream doesn't flicker the display between "have data" and "no

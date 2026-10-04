@@ -33,20 +33,6 @@ def get_sample_images():
     print(f"Found {len(paths)} sample images in {SAMPLE_IMAGES_DIR}")
     return paths
 
-def compute_cluster_density(boxes, frame_area):
-    """
-    Estimate density as total object area / frame area.
-
-    This is a 2D coverage signal only -- it can't tell a small nearby rock
-    from a large distant boulder apart, since both can cover the same
-    fraction of the frame. Use estimate_object_proximity() for a
-    distance-aware "is this actually close" signal.
-    """
-    if len(boxes) == 0:
-        return 0
-    total_area = sum([(x2 - x1) * (y2 - y1) for (x1, y1, x2, y2) in boxes])
-    return total_area / frame_area
-
 def estimate_object_proximity(boxes, depth_map, frame_size):
     """
     Distance-aware proximity of the nearest detected object, using the terrain

@@ -14,7 +14,7 @@ Division of responsibility, deliberately: the planner answers "what's the
 best global route to the goal, given everything mapped so far" -- a slow,
 whole-map computation. `safety_gate` answers "is it safe to take the very
 next step of that route, right now" -- a fast, single-frame check driven by
-the same live terrain_risk/object_proximity/cluster_density signals
+the same live terrain_risk/object_proximity signals
 main.py already computes every frame. The planner has no visibility into
 those live signals (it only sees the accumulated map) and the gate has no
 visibility into the route (it only sees one waypoint) -- that separation is
@@ -152,12 +152,11 @@ class GateResult:
     meta: dict = field(default_factory=dict)
 
 
-def safety_gate(next_waypoint, terrain_risk, object_proximity=0.0, cluster_density=0.0, **should_proceed_kwargs):
+def safety_gate(next_waypoint, terrain_risk, object_proximity=0.0, **should_proceed_kwargs):
     """
     Reactive veto over the planner's proposed next step, using the SAME
     live risk signals main.py already computes every frame (terrain_risk
-    from TerrainAnalyzer, object_proximity/cluster_density from
-    src/utils.py). Calls the existing `should_proceed()` unmodified and
+    from TerrainAnalyzer, object_proximity from src/utils.py). Calls the existing `should_proceed()` unmodified and
     unduplicated -- this function contains no risk-threshold logic of its
     own, only the policy for what to do with should_proceed's answer:
 
@@ -173,7 +172,7 @@ def safety_gate(next_waypoint, terrain_risk, object_proximity=0.0, cluster_densi
     (e.g. custom thresholds), so this gate never hardcodes a threshold
     should_proceed already owns.
     """
-    decision = should_proceed(terrain_risk, object_proximity, cluster_density, **should_proceed_kwargs)
+    decision = should_proceed(terrain_risk, object_proximity, **should_proceed_kwargs)
 
     if decision == "STOP":
         return GateResult(action="HALT", decision=decision, waypoint=None, replan=True)
